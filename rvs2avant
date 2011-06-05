@@ -1,0 +1,292 @@
+#!/usr/bin/perl 
+# vim: set expandtab tabstop=2 shiftwidth=2 softtabstop=2 foldmethod=marker:
+###############
+###
+#   rvs2avant - Importa tutti i fax e la ru-
+#       brica da rvs-com a avantfax
+#   -----------
+#   ver 1.5
+#
+#   oldsparky, oldsparky@bmlabs.net
+#
+#   created 20110518
+#   last mod. 20110605
+#
+### 
+#   GNU General Public License
+#   -----------
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#############################################
+
+use strict;
+use DBI;
+use File::Path qw( make_path );
+use Time::HiRes qw( gettimeofday tv_interval );
+use Text::Iconv;
+#use Data::Dumper;
+#use warnings;
+
+# Vars
+my @faxPaths = qw( /tmp/FAX/ /tmp/OUT/ );
+my $sqlHost = 'localhost';
+my $sqlDB = 'fax';
+my $sqlUser = 'fax';
+my $sqlPw = 'tgyhuj567'; 
+
+# Dir listing
+my @ADRs;
+for( @faxPaths ){
+  push( @ADRs, < $_*.ADR > );
+}
+my $totFax = scalar( grep( $_, @ADRs ) );
+print 'info > total faxes to export loaded: '.$totFax."\n";
+
+# String conversion to UTF8
+my $enc2utf = new Text::Iconv( my $enc, 'utf8')
+  or die "Can't create enc2utf converter";
+
+# Connect to db
+my $sqlH = DBI->connect( "DBI:mysql:database=$sqlDB;host=$sqlHost", 
+  $sqlUser, $sqlPw, { 'RaiseError' => 1 } );
+
+# New fax loading ...
+my $numFax = 0;
+my $totTime = 0;
+foreach my $nameADR ( @ADRs ){
+
+  # Get initial time to calculate the elapsed one
+  my $t0 = [gettimeofday];
+
+  # Fetch fax infos
+  open( hADR, '<', "$nameADR" ) or die "error > file non trovato: ".$nameADR."\n";
+  my @rawADR = <hADR>;
+  close( hADR );
+  for( @rawADR ){
+    if( /^.+=[{+a-zA-Z0-9]+/ ){
+      chop();
+      s/\s+$//;
+      if( /F(AX|XT0001|XT)\.SFF/ ){
+        $_ =~ s/^(.+)=F(AX|XT0001|XT)\.SFF$/FILENAME=$1/;
+      }
+    } else{
+      undef $_;
+    }
+  }
+  my %infoADR = map{ split( /=/, $_ , 2 ) } grep( defined, @rawADR );
+
+  #print Dumper( @rawADR );
+  #print Dumper( \%infoADR );
+
+  # IN or OUT
+  my $faxType = $infoADR{'TYPE'} ? 'recvd' : 'sent';
+  my $faxDev = $infoADR{'TYPE'} ? 'ttyIAX' : '';
+
+  # Vars
+  my $rvsID = $infoADR{'MESSAGEGUID'};
+  $rvsID =~ s/[{}]//g;
+  my $sffName = $infoADR{'FILENAME'};
+  my @faxDate = localtime( $infoADR{'TIME'} );
+  $faxDate[5] += 1900;
+  $faxDate[4] = substr("0" x 2 . $faxDate[4],-2);
+  $faxDate[3] = substr("0" x 2 . $faxDate[3],-2);
+  my $nFaxPathDB = '/faxes/'.$faxType.'/'.$faxDate[5].'/'.$faxDate[4].'/'.$faxDate[3].'/'.$rvsID; 
+  my $nFaxPath = '/var/www/fax'.$nFaxPathDB.'/';
+  my $faxPath = $nameADR;
+  $faxPath =~ s/^(.+)\/.+\.ADR/$1\//;
+  my $mTime = "$faxDate[5]-$faxDate[4]-$faxDate[3] $faxDate[2]:$faxDate[0]:$faxDate[1]";
+  my $rTime = $infoADR{'ENDTIME'} - $infoADR{'STARTTIME'};
+  
+  $numFax ++;
+
+  # Check fax pages
+  if( $infoADR{'FAXPAGES'} == 0 ){
+    print 'notice > fax '.$sffName." seems not have any valid page, skip.\n";
+    next;
+  }
+
+  # Check if the fax was already imported
+  if( -d $nFaxPath ){
+    print 'notice > fax '.$sffName." already imported!\n";
+    next;
+  }
+
+  # Check if the sff file exist
+  if( ! -f $faxPath.$sffName ){
+    print 'notice > fax file '.$sffName." not exist, skip.\n";
+    next;
+  }
+  
+  # Check CALLINGNUMBER / CALLEDNUMBER content
+  my $faxNum;
+  if( $infoADR{'TYPE'} ){
+    if( $infoADR{'CALLINGNUMBER'} =~ /^\+\d+\s\d{4,}$/ ){
+      $faxNum = $infoADR{'CALLINGNUMBER'};
+      $faxNum =~ s/^\+(\d+)\s(\d+)$/00${1}0$2/;
+    }
+  } else{
+    if( defined $infoADR{'CALLEDNUMBER'} ){
+      $infoADR{'CALLEDNUMBER'} =~ s/1022|\s|-//g;
+      $faxNum = $infoADR{'CALLEDNUMBER'};
+      $faxNum =~ s/\+/00/;
+    }
+  }
+
+  # Check FAX remote ID (anonymous or absent ID)
+  $infoADR{'FAXREMOTEID'} = 'XXXXXXX' 
+    if( ! $faxNum );
+  if( $infoADR{'FAXREMOTEID'} =~ /^$/ ){
+    $infoADR{'FAXREMOTEID'} = $faxNum;
+    if( defined $infoADR{'NAME'} ){
+      $infoADR{'FAXREMOTEID'} = $enc2utf->convert( $infoADR{'NAME'} );
+      $infoADR{'FAXREMOTEID'} =~ s/[^a-zA-Z0-9\s]*//g;
+    }
+  }
+
+  # Address book check & insert
+  my $cpnyID;
+  my $getAddr = $sqlH->prepare( "SELECT * FROM AddressBook WHERE company = '".$infoADR{'FAXREMOTEID'}."'" );
+  $getAddr->execute();
+  if( $getAddr->rows == 0 ){
+    # Insert to database
+    my $getID = $sqlH->prepare( "INSERT INTO AddressBook ( company ) VALUES ( '".$infoADR{'FAXREMOTEID'}."' )" );
+    $getID->execute();
+    $cpnyID = $getID->{ q{mysql_insertid} };
+    $getID->finish();
+    $sqlH->do( "INSERT INTO AddressBookFAX ( abook_id, faxnumber, faxfrom ) VALUES ( '".$cpnyID."', 
+      '".$faxNum."', 1 )" ) if( $cpnyID );
+  } else{
+    if( $getAddr->rows > 1 ){
+      print 'error > '.$infoADR{'FAXREMOTEID'}." clone detected on the db!\n";
+    } else{
+      my $addrRef = $getAddr->fetchrow_hashref();
+      $cpnyID = $addrRef->{'abook_id'};
+      
+      # Increase +1
+      my $incFaxCnt = $infoADR{'TYPE'} ? 'faxfrom = faxfrom' : 'faxto = faxto';
+      $sqlH->do( "UPDATE AddressBookFAX SET ".$incFaxCnt."+1 WHERE abook_id = ".$cpnyID );
+    }
+  }
+  $getAddr->finish();
+  die 'error > can\'t retrieve fax ID '.$infoADR{'FAXREMOTEID'}.' - '.$faxNum."\n"
+    if( ! $cpnyID );
+
+  # Create a description
+  my $faxDesc;
+  $faxDesc .= $infoADR{'NAME'}.' - '
+    if( defined $infoADR{'NAME'} );
+  $faxDesc .= $infoADR{'SUBJECT'}.' - '
+    if( defined $infoADR{'SUBJECT'} );
+  $faxDesc .= 'Ricevuto a '.$infoADR{'FAXSPEED'}.'bps in '.$rTime.' sec.';
+  $faxDesc = $enc2utf->convert( $faxDesc );
+
+  # Insert new fax into avantfax db
+  $sqlH->do( "INSERT INTO FaxArchive ( faxnumid, companyid, faxpath, pages, faxcatid, description, lastoperation, 
+    lastmoduser, lastmoddate, archstamp, modemdev, origfaxnum, inbox ) VALUES ( 0, '".$cpnyID."', '".$nFaxPathDB."', 
+    '".$infoADR{'FAXPAGES'}."', 2, ".$sqlH->quote( $faxDesc ).", NOW(), 2, NOW(), '".$mTime."', '".$faxDev."', '"
+    .$faxNum."', 0 )" );
+
+  # Create new fax dir
+  make_path( $nFaxPath, { mode => 0775 } );
+
+  # Convert sff to tif, tif to pdf and generate gif thumbnails
+  system( '/usr/bin/sfftobmp -t -d -o '.$nFaxPath.'fax.tif '.$faxPath.$sffName.' > /dev/null 2>&1' ) == 0 
+    or die "error > '.$sffName.' tif file not generated\n";
+  system( '/usr/bin/tiff2pdf -o '.$nFaxPath.'fax.pdf '.$nFaxPath.'fax.tif > /dev/null 2>&1' ) == 0
+    or die "error > '.$sffName.' pdf file not generated\n";
+  system( '/usr/bin/tiffsplit '.$nFaxPath.'fax.tif  /tmp/thumb_ > /dev/null 2>&1' ) == 0
+    or die "error > '.$sffName.' splitted tif thumb_* files not generated\n";
+  my $enel = 0;
+  my @thumbs = < /tmp/thumb_*.tif >;
+  foreach my $thumb ( @thumbs ){
+    system( '/usr/bin/convert -scale 80 '.$thumb.' '.$nFaxPath.'thumb.gif' ) == 0
+      or die "error > '.$sffName.' can't create thumb.gif\n" if ( $enel == 0 );
+    system( '/usr/bin/convert -scale 750 '.$thumb.' '.$nFaxPath.'prev'.$enel.'.gif > /dev/null 2>&1' ) == 0
+      or die "error > '.$sffName.' can't create prev gif files\n";
+    $enel ++;
+  }
+  chmod( 0664, < ${nFaxPath}* > );
+  unlink glob '/tmp/thumb_*.tif';
+
+  # Get elapsed time
+  my $eTime = tv_interval ($t0); 
+
+  # Print success notice and time used
+  my $percent = ( $numFax * 100 ) / $totFax;
+  printf( "info > %6.2f%% left: fax %s imported in %.3f sec!\n", $percent, $sffName, $eTime );
+  
+  $totTime += $eTime;
+}
+
+# Delete all duplicate fax numbers
+my $t0 = [gettimeofday];
+my $howDNum = $sqlH->prepare( "SELECT faxnumber, COUNT(*) AS count FROM AddressBookFAX GROUP BY 
+  faxnumber HAVING COUNT(*) > 1" );
+$howDNum->execute();
+if( $howDNum->rows > 0 ){
+  while( my $numRef = $howDNum->fetchrow_hashref() ){
+    print 'notice > '.$numRef->{'count'}.' duplicate for fax number '.$numRef->{'faxnumber'}.
+      " has been found! Select the FAX ID you prefer:\n";
+    my $listDNum = $sqlH->prepare( "SELECT t1.abookfax_id, t1.abook_id, t1.faxfrom, t1.faxto, t2.company 
+      FROM AddressBookFAX AS t1 LEFT JOIN AddressBook AS t2 ON t1.abook_id = t2.abook_id WHERE 
+      faxnumber = '".$numRef->{'faxnumber'}."'" );
+    $listDNum->execute();
+    my $enel = 0;
+    my @aBookID;
+    my @aBFaxID;
+    my $tFaxFrom;
+    my $tFaxTo;
+    while( my $fIdRef = $listDNum->fetchrow_hashref() ){
+      print $enel.' - '.$fIdRef->{'company'}."\n";
+      push( @aBookID, $fIdRef->{'abook_id'} );
+      push( @aBFaxID, $fIdRef->{'abookfax_id'} );
+      $tFaxFrom += $fIdRef->{'faxfrom'};
+      $tFaxTo += $fIdRef->{'faxto'};
+      $enel ++;
+    }
+    $listDNum->finish();
+    my $stdin;
+    my $chMsg = 'Enter ID number: ';
+    while( $stdin !~ /^\d{1,2}$/ || $stdin >= $numRef->{'count'} ){
+      print $chMsg;
+      chomp( $stdin = <STDIN> );
+      $chMsg = "Please enter ID again: ";
+    }
+    foreach my $IDindex ( 0..$#aBookID ){
+      if( $IDindex != $stdin ){
+        $sqlH->do( "DELETE FROM AddressBook WHERE abook_id = '".$aBookID[$IDindex]."'" );
+        $sqlH->do( "DELETE FROM AddressBookFAX WHERE abookfax_id = '".$aBFaxID[$IDindex]."'" );
+        $sqlH->do( "UPDATE FaxArchive SET companyid = '".$aBookID[$stdin]."' WHERE companyid = '".
+          $aBookID[$IDindex]."'" );
+      }
+    }
+    $sqlH->do( "UPDATE AddressBookFAX SET faxfrom = faxfrom + ".$tFaxFrom.", faxto = faxto + ".$tFaxTo.
+      " WHERE abookfax_id = '".$aBFaxID[$stdin]."'" );
+  }
+}
+$howDNum->finish();
+
+# Get duplicate elapsed time
+my $eTime = tv_interval ($t0); 
+$totTime += $eTime;
+
+# Close db
+$sqlH->disconnect();
+
+my @splitTotTime = localtime( int( $totTime ) );
+printf( "info > import process finished! Amount of time requested: %dh %dm %ds\n", ( $splitTotTime[2] - 1 ), 
+  $splitTotTime[1], $splitTotTime[0] );
+
+##EOF
