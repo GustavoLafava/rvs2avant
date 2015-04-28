@@ -1,0 +1,1 @@
+This perl script is useful if you need to import all your IN/OUT faxes from the old and now unsupported RVS-COM fax software to AvantFAX/HylaFAX system. All that you need is your old .SFF fax file and the fax files descriptor .ADR.
